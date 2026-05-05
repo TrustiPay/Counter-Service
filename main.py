@@ -1,7 +1,7 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, ValidationError
-import requests
+import httpx
 import hashlib
 import hmac
 import json
@@ -23,9 +23,17 @@ SYNC_INTERVAL = int(os.getenv("SYNC_INTERVAL", "5"))
 
 HMAC_SECRET = "trustipay_demo_secret"
 
+KEY_MAP = {
+    "t": "tx_id", "s": "sender_id", "r": "receiver_id",
+    "ts": "timestamp", "a": "amount", "c": "category",
+    "l": "location", "d": "device_id", "dt": "device_type",
+    "nt": "network_type", "n": "nonce", "p": "prev_hash", "sig": "signature",
+}
+
 tx_queue: asyncio.Queue = asyncio.Queue()
 
 _db = None
+_http: httpx.AsyncClient = None
 
 
 def init_firebase():
@@ -44,7 +52,6 @@ def init_firebase():
 # ── Blocking helpers (run in thread-pool executor) ────────────────────────────
 
 def fetch_pending_transactions() -> list[dict]:
-    """Fetch PENDING_SYNC docs from Firebase and mark them Processing."""
     if _db is None:
         return []
     docs = list(
@@ -62,8 +69,7 @@ def fetch_pending_transactions() -> list[dict]:
     return result
 
 
-def process_offline_transaction(tx: dict):
-    """Validate and append a Firebase offline transaction to the central ledger."""
+async def process_offline_transaction(tx: dict):
     tx_id = tx.get("tx_id")
     try:
         amount = float(tx.get("amount", 0))
@@ -89,18 +95,18 @@ def process_offline_transaction(tx: dict):
 
         if not verify_signature(payload):
             payload.update({"status": "REJECTED", "reason": "Invalid signature"})
-            append_transaction(payload)
+            await append_transaction(payload)
             print(f"[Queue] {tx_id} rejected: invalid signature")
             return
 
-        if check_duplicate_tx(tx_id):
+        if await check_duplicate_tx(tx_id):
             payload.update({"status": "REJECTED", "reason": "Duplicate transaction"})
-            append_transaction(payload)
+            await append_transaction(payload)
             print(f"[Queue] {tx_id} rejected: duplicate")
             return
 
         payload.update({"status": "PENDING", "reason": "Awaiting online processing"})
-        append_transaction(payload)
+        await append_transaction(payload)
         print(f"[Queue] {tx_id} appended to ledger")
 
     except Exception as e:
@@ -111,7 +117,7 @@ def process_offline_transaction(tx: dict):
 
 async def firebase_sync_loop():
     loop = asyncio.get_event_loop()
-    print("[Firebase Sync] Started — interval: {SYNC_INTERVAL}s")
+    print(f"[Firebase Sync] Started — interval: {SYNC_INTERVAL}s")
     while True:
         await asyncio.sleep(SYNC_INTERVAL)
         try:
@@ -123,12 +129,11 @@ async def firebase_sync_loop():
 
 
 async def queue_worker_loop():
-    loop = asyncio.get_event_loop()
     print("[Queue Worker] Started")
     while True:
         tx = await tx_queue.get()
         try:
-            await loop.run_in_executor(None, process_offline_transaction, tx)
+            await process_offline_transaction(tx)
         finally:
             tx_queue.task_done()
 
@@ -137,6 +142,8 @@ async def queue_worker_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _http
+    _http = httpx.AsyncClient(timeout=10.0)
     init_firebase()
     sync_task = asyncio.create_task(firebase_sync_loop())
     worker_task = asyncio.create_task(queue_worker_loop())
@@ -144,6 +151,7 @@ async def lifespan(app: FastAPI):
     sync_task.cancel()
     worker_task.cancel()
     await asyncio.gather(sync_task, worker_task, return_exceptions=True)
+    await _http.aclose()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -168,47 +176,45 @@ class MinifiedIOU(BaseModel):
 
 
 def expand_iou(data: MinifiedIOU) -> dict:
-    KEY_MAP = {
-        "t": "tx_id", "s": "sender_id", "r": "receiver_id",
-        "ts": "timestamp", "a": "amount", "c": "category",
-        "l": "location", "d": "device_id", "dt": "device_type",
-        "nt": "network_type", "n": "nonce", "p": "prev_hash", "sig": "signature",
-    }
-    return {KEY_MAP[k]: v for k, v in data.dict().items()}
+    return {KEY_MAP[k]: v for k, v in data.model_dump().items()}
 
 
 def verify_signature(payload: dict) -> bool:
-    signature = payload.pop("signature", None)
+    signature = payload.get("signature")
     if not signature:
         return False
-    body = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+    body = json.dumps(
+        {k: v for k, v in payload.items() if k != "signature"},
+        separators=(",", ":"),
+        sort_keys=True,
+    )
     expected = hmac.new(HMAC_SECRET.encode(), body.encode(), hashlib.sha256).hexdigest()
     return compare_digest(expected, signature)
 
 
-def check_duplicate_tx(tx_id: str) -> bool:
-    r = requests.get(f"{CENTRAL_LEDGER_URL}/ledger/transactions/{tx_id}/exists")
+async def check_duplicate_tx(tx_id: str) -> bool:
+    r = await _http.get(f"{CENTRAL_LEDGER_URL}/ledger/transactions/{tx_id}/exists")
     if r.status_code != 200:
         raise HTTPException(status_code=500, detail="Central ledger service error")
     return r.json().get("exists", False)
 
 
-def check_sufficient_balance(sender_id, amount: float) -> bool:
-    r = requests.get(f"{CENTRAL_LEDGER_URL}/ledger/users/{sender_id}")
+async def check_sufficient_balance(sender_id, amount: float) -> bool:
+    r = await _http.get(f"{CENTRAL_LEDGER_URL}/ledger/users/{sender_id}")
     if r.status_code != 200:
         raise HTTPException(status_code=500, detail="Central ledger service error")
     return r.json().get("current_balance", 0) >= amount
 
 
-def get_user(user_id) -> dict:
-    r = requests.get(f"{CENTRAL_LEDGER_URL}/ledger/users/{user_id}")
+async def get_user(user_id) -> dict:
+    r = await _http.get(f"{CENTRAL_LEDGER_URL}/ledger/users/{user_id}")
     if r.status_code != 200:
         raise Exception("Error retrieving user details")
     return r.json()
 
 
-def append_transaction(transaction: dict) -> dict:
-    r = requests.post(f"{CENTRAL_LEDGER_URL}/ledger/transactions", json=transaction)
+async def append_transaction(transaction: dict) -> dict:
+    r = await _http.post(f"{CENTRAL_LEDGER_URL}/ledger/transactions", json=transaction)
     if r.status_code != 200:
         raise Exception("Error appending transaction to ledger")
     return r.json()
@@ -227,12 +233,13 @@ def queue_status():
 
 
 @app.get("/ledger-data")
-def get_ledger_data():
-    return requests.get(f"{CENTRAL_LEDGER_URL}/ledger").json()
+async def get_ledger_data():
+    r = await _http.get(f"{CENTRAL_LEDGER_URL}/ledger")
+    return r.json()
 
 
 @app.post("/counter/transactions")
-def process_transaction(iou: MinifiedIOU):
+async def process_transaction(iou: MinifiedIOU):
     try:
         expanded = expand_iou(iou)
 
@@ -241,21 +248,23 @@ def process_transaction(iou: MinifiedIOU):
 
         if not verify_signature(expanded):
             expanded.update({"status": "REJECTED", "reason": "Invalid signature"})
-            append_transaction(expanded)
+            await append_transaction(expanded)
             return {"message": "Transaction rejected", "reason": "Invalid signature"}
 
-        if check_duplicate_tx(expanded["tx_id"]):
+        if await check_duplicate_tx(expanded["tx_id"]):
             expanded.update({"status": "REJECTED", "reason": "Duplicate transaction"})
-            append_transaction(expanded)
+            await append_transaction(expanded)
             return {"message": "Transaction rejected", "reason": "Duplicate transaction"}
 
-        if not check_sufficient_balance(expanded["sender_id"], expanded["amount"]):
+        if not await check_sufficient_balance(expanded["sender_id"], expanded["amount"]):
             expanded.update({"status": "REJECTED", "reason": "Insufficient balance"})
-            append_transaction(expanded)
+            await append_transaction(expanded)
             return {"message": "Transaction rejected", "reason": "Insufficient balance"}
 
-        sender = get_user(expanded["sender_id"])
-        receiver = get_user(expanded["receiver_id"])
+        sender, receiver = await asyncio.gather(
+            get_user(expanded["sender_id"]),
+            get_user(expanded["receiver_id"]),
+        )
 
         fraud_payload = {
             **expanded,
@@ -264,7 +273,7 @@ def process_transaction(iou: MinifiedIOU):
             "phone_number": sender.get("phone_number"),
         }
 
-        fraud_response = requests.post(f"{FRAUD_MODEL_URL}/fraud/check", json=fraud_payload)
+        fraud_response = await _http.post(f"{FRAUD_MODEL_URL}/fraud/check", json=fraud_payload)
         if fraud_response.status_code != 200:
             raise HTTPException(status_code=500, detail="Fraud model service error")
 
@@ -279,7 +288,7 @@ def process_transaction(iou: MinifiedIOU):
         else:
             expanded["status"] = "REJECTED"
 
-        append_transaction(expanded)
+        await append_transaction(expanded)
         return {
             "message": "Transaction processed successfully",
             "status": expanded["status"],

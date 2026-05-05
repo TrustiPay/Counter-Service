@@ -20,8 +20,6 @@ env/
 !.env.example
 
 # Dev tooling
-.git/
-.gitignore
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
@@ -37,6 +35,3 @@ htmlcov/
 # OS
 .DS_Store
 Thumbs.db
-
-# Docs
-README.md
