@@ -9,6 +9,7 @@ import asyncio
 import time
 import os
 from secrets import compare_digest
+from typing import Optional
 from dotenv import load_dotenv
 
 import firebase_admin
@@ -37,7 +38,7 @@ fraud_queue: asyncio.Queue = asyncio.Queue()   # transactions awaiting fraud che
 
 _db = None
 _http: httpx.AsyncClient = None
-_current_fraud_task: dict | None = None        # tracks the single in-flight fraud check
+_current_fraud_task: Optional[dict] = None        # tracks the single in-flight fraud check
 
 
 def init_firebase():
