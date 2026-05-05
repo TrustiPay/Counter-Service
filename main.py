@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import asyncio
+import time
 import os
 from secrets import compare_digest
 from dotenv import load_dotenv
@@ -30,10 +31,13 @@ KEY_MAP = {
     "nt": "network_type", "n": "nonce", "p": "prev_hash", "sig": "signature",
 }
 
-tx_queue: asyncio.Queue = asyncio.Queue()
+# Queues
+tx_queue: asyncio.Queue = asyncio.Queue()      # offline Firebase transactions
+fraud_queue: asyncio.Queue = asyncio.Queue()   # transactions awaiting fraud check
 
 _db = None
 _http: httpx.AsyncClient = None
+_current_fraud_task: dict | None = None        # tracks the single in-flight fraud check
 
 
 def init_firebase():
@@ -105,12 +109,58 @@ async def process_offline_transaction(tx: dict):
             print(f"[Queue] {tx_id} rejected: duplicate")
             return
 
-        payload.update({"status": "PENDING", "reason": "Awaiting online processing"})
+        payload["status"] = "FRAUD_PENDING"
         await append_transaction(payload)
-        print(f"[Queue] {tx_id} appended to ledger")
+        await fraud_queue.put(payload)
+        print(f"[Queue] {tx_id} queued for fraud check")
 
     except Exception as e:
         print(f"[Queue] Error on {tx_id}: {e}")
+
+
+# ── Fraud check worker (processes one at a time) ──────────────────────────────
+
+async def process_fraud_check(tx: dict):
+    tx_id = tx.get("tx_id")
+    try:
+        sender, receiver = await asyncio.gather(
+            get_user(tx["sender_id"]),
+            get_user(tx["receiver_id"]),
+        )
+
+        fraud_payload = {
+            **tx,
+            "sender_current_balance": sender.get("current_balance"),
+            "receiver_current_balance": receiver.get("current_balance"),
+            "phone_number": sender.get("phone_number"),
+        }
+
+        fraud_response = await _http.post(f"{FRAUD_MODEL_URL}/fraud/check", json=fraud_payload)
+        if fraud_response.status_code != 200:
+            await update_transaction(tx_id, {"status": "REJECTED", "reason": "Fraud model error"})
+            print(f"[Fraud Worker] {tx_id} → REJECTED (model error)")
+            return
+
+        fraud_result = fraud_response.json()
+        fraud_status = fraud_result.get("status", "REJECTED")
+        reason = fraud_result.get("reason", "")
+
+        if fraud_status == "ACCEPTED":
+            status = "APPROVED"
+        elif fraud_status == "OTP_PENDING":
+            status = "OTP_PENDING"
+        else:
+            status = "REJECTED"
+
+        await update_transaction(tx_id, {"status": status, "reason": reason})
+        print(f"[Fraud Worker] {tx_id} → {status}")
+
+    except Exception as e:
+        print(f"[Fraud Worker] Error on {tx_id}: {e}")
+        try:
+            await update_transaction(tx_id, {"status": "REJECTED", "reason": "Internal error"})
+        except Exception:
+            pass
 
 
 # ── Async background loops ────────────────────────────────────────────────────
@@ -138,19 +188,40 @@ async def queue_worker_loop():
             tx_queue.task_done()
 
 
+async def fraud_worker_loop():
+    """Processes fraud checks one at a time to avoid overwhelming the model service."""
+    global _current_fraud_task
+    print("[Fraud Worker] Started")
+    while True:
+        tx = await fraud_queue.get()
+        _current_fraud_task = {
+            "tx_id": tx.get("tx_id"),
+            "sender_id": tx.get("sender_id"),
+            "amount": tx.get("amount"),
+            "started_at": time.time(),
+        }
+        try:
+            await process_fraud_check(tx)
+        finally:
+            _current_fraud_task = None
+            fraud_queue.task_done()
+
+
 # ── App lifespan ──────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _http
-    _http = httpx.AsyncClient(timeout=10.0)
+    _http = httpx.AsyncClient(timeout=30.0)
     init_firebase()
     sync_task = asyncio.create_task(firebase_sync_loop())
     worker_task = asyncio.create_task(queue_worker_loop())
+    fraud_task = asyncio.create_task(fraud_worker_loop())
     yield
     sync_task.cancel()
     worker_task.cancel()
-    await asyncio.gather(sync_task, worker_task, return_exceptions=True)
+    fraud_task.cancel()
+    await asyncio.gather(sync_task, worker_task, fraud_task, return_exceptions=True)
     await _http.aclose()
 
 
@@ -220,6 +291,12 @@ async def append_transaction(transaction: dict) -> dict:
     return r.json()
 
 
+async def update_transaction(tx_id: str, updates: dict):
+    r = await _http.patch(f"{CENTRAL_LEDGER_URL}/ledger/transactions/{tx_id}", json=updates)
+    if r.status_code not in (200, 204):
+        raise Exception(f"Error updating transaction {tx_id}: {r.status_code}")
+
+
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @app.get("/health")
@@ -230,6 +307,21 @@ def health_check():
 @app.get("/counter/queue/status")
 def queue_status():
     return {"queue_size": tx_queue.qsize()}
+
+
+@app.get("/counter/status")
+def get_status():
+    current = None
+    if _current_fraud_task:
+        current = {
+            **_current_fraud_task,
+            "elapsed_seconds": round(time.time() - _current_fraud_task["started_at"], 1),
+        }
+    return {
+        "tx_queue_size": tx_queue.qsize(),
+        "fraud_queue_size": fraud_queue.qsize(),
+        "current_fraud_task": current,
+    }
 
 
 @app.get("/ledger-data")
@@ -261,38 +353,16 @@ async def process_transaction(iou: MinifiedIOU):
             await append_transaction(expanded)
             return {"message": "Transaction rejected", "reason": "Insufficient balance"}
 
-        sender, receiver = await asyncio.gather(
-            get_user(expanded["sender_id"]),
-            get_user(expanded["receiver_id"]),
-        )
-
-        fraud_payload = {
-            **expanded,
-            "sender_current_balance": sender.get("current_balance"),
-            "receiver_current_balance": receiver.get("current_balance"),
-            "phone_number": sender.get("phone_number"),
-        }
-
-        fraud_response = await _http.post(f"{FRAUD_MODEL_URL}/fraud/check", json=fraud_payload)
-        if fraud_response.status_code != 200:
-            raise HTTPException(status_code=500, detail="Fraud model service error")
-
-        fraud_result = fraud_response.json()
-        fraud_status = fraud_result.get("status", "REJECTED")
-        expanded["reason"] = fraud_result.get("reason", "Fraud model error")
-
-        if fraud_status == "ACCEPTED":
-            expanded["status"] = "APPROVED"
-        elif fraud_status == "OTP_PENDING":
-            expanded["status"] = "OTP_PENDING"
-        else:
-            expanded["status"] = "REJECTED"
-
+        # Append immediately as FRAUD_PENDING and hand off to the background worker.
+        # The caller does not wait for the fraud model response.
+        expanded["status"] = "FRAUD_PENDING"
         await append_transaction(expanded)
+        await fraud_queue.put(expanded)
+
         return {
-            "message": "Transaction processed successfully",
-            "status": expanded["status"],
-            "reason": expanded["reason"],
+            "message": "Transaction queued for fraud assessment",
+            "status": "FRAUD_PENDING",
+            "tx_id": expanded["tx_id"],
         }
 
     except ValidationError:
