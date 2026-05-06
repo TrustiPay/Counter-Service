@@ -1,7 +1,10 @@
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    HOME=/tmp \
+    STREAMLIT_SERVER_HEADLESS=true \
+    STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
 
 WORKDIR /app
 
@@ -15,7 +18,6 @@ USER appuser
 
 EXPOSE 8501
 
-ENTRYPOINT ["streamlit", "run", "dashboard.py", \
-            "--server.port=8501", \
-            "--server.address=0.0.0.0", \
-            "--server.headless=true"]
+CMD ["streamlit", "run", "dashboard.py", \
+     "--server.port=8501", \
+     "--server.address=0.0.0.0"]

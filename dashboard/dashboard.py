@@ -1,5 +1,6 @@
 import time
 from datetime import datetime
+import os
 
 import pandas as pd
 import requests
@@ -15,7 +16,8 @@ st.set_page_config(
 
 with st.sidebar:
     st.title("⚙️ Settings")
-    counter_url = st.text_input("Counter Service URL", value="http://localhost:8000")
+    default_counter_url = os.getenv("COUNTER_URL", "http://localhost:8000")
+    counter_url = st.text_input("Counter Service URL", value=default_counter_url)
     refresh_interval = st.slider("Refresh interval (s)", min_value=2, max_value=30, value=5)
     st.divider()
     if st.button("🔄 Refresh now"):
