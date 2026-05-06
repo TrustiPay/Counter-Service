@@ -166,6 +166,15 @@ docker run -p 8501:8501 -e COUNTER_URL=http://host.docker.internal:8000 counter-
 
 This uses the separate `dashboard/Dockerfile` and runs only the Streamlit dashboard on port `8501`.
 
+If your deploy platform builds from the repository root, use the root-context dashboard Dockerfile instead:
+
+```bash
+docker build -t counter-dashboard -f Dockerfile.dashboard .
+docker run -p 8501:8501 -e COUNTER_URL=http://host.docker.internal:8000 counter-dashboard
+```
+
+For hosted dashboard deployments, make sure the Dockerfile is `Dockerfile.dashboard` or `dashboard/Dockerfile`, the exposed port is `8501`, and there is no start command such as `uvicorn main:app`.
+
 ---
 
 ## Project Structure
@@ -174,7 +183,8 @@ This uses the separate `dashboard/Dockerfile` and runs only the Streamlit dashbo
 counter-service/
 ├── main.py                 # FastAPI app
 ├── requirements.txt
-├── Dockerfile
+├── Dockerfile              # FastAPI API image
+├── Dockerfile.dashboard    # Streamlit dashboard image for root-context builds
 ├── .env.example
 ├── .gitignore
 ├── .dockerignore

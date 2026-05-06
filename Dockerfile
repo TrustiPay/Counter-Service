@@ -8,7 +8,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir --compile -r requirements.txt
 
-COPY . .
+COPY main.py .
 
 RUN adduser --disabled-password --no-create-home appuser
 USER appuser
