@@ -164,6 +164,8 @@ docker build -t counter-dashboard ./dashboard
 docker run -p 8501:8501 -e COUNTER_URL=http://host.docker.internal:8000 counter-dashboard
 ```
 
+This uses the separate `dashboard/Dockerfile` and runs only the Streamlit dashboard on port `8501`.
+
 ---
 
 ## Project Structure
@@ -177,6 +179,7 @@ counter-service/
 ├── .gitignore
 ├── .dockerignore
 └── dashboard/
+    ├── .dockerignore
     ├── dashboard.py        # Streamlit dashboard
     ├── requirements.txt
     └── Dockerfile

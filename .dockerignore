@@ -40,3 +40,6 @@ Thumbs.db
 
 # Docs
 README.md
+
+# Separate Streamlit image
+dashboard/
